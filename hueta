@@ -1,0 +1,45 @@
+import fitz  # PyMuPDF
+
+def compute_affine_transform(pdf_path, top_text, bottom_text, desired_top, desired_bottom, scale_x=1.75):
+    doc = fitz.open(pdf_path)
+    page = doc[0]
+
+    def find_text_rect(text):
+        results = page.search_for(text)
+        if not results:
+            raise ValueError(f"Текст '{text}' не найден")
+        return results[0]
+
+    rect_top = find_text_rect(top_text)
+    rect_bottom = find_text_rect(bottom_text)
+
+    current_top_y = rect_top.y0
+    current_bottom_y = rect_bottom.y0
+
+    desired_top_y = desired_top[1]
+    desired_bottom_y = desired_bottom[1]
+
+    # Решаем систему:
+    # desired_top_y = A*current_top_y + B
+    # desired_bottom_y = A*current_bottom_y + B
+    A = (desired_bottom_y - desired_top_y) / (current_bottom_y - current_top_y)
+    B = desired_top_y - A * current_top_y
+
+    # Теперь можно пересчитать любую координату
+    def transform_y(y_old):
+        return A * y_old + B
+
+    coords = {}
+    for name, rect, desired in [
+        ("top", rect_top, desired_top),
+        ("bottom", rect_bottom, desired_bottom)
+    ]:
+        coords[name] = {
+            "page": page.number,
+            "orig_y": rect.y0,
+            "new_y": transform_y(rect.y0),
+            "desired": desired
+        }
+
+    doc.close()
+    return scale_x, A, B, coords
