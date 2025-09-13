@@ -1,0 +1,31 @@
+import fitz  # PyMuPDF
+
+def find_signature_place(pdf_path, str_person, scale_x=1.75, scale_y=None):
+    out = []
+    doc = fitz.open(pdf_path)
+    for page in doc:
+        text_instances = page.search_for(str_person)
+        if text_instances:
+            for instance in text_instances:
+                # Если scale_y не задан, то берём scale_x (старое поведение)
+                if scale_y is None:
+                    scale_y = scale_x
+
+                mat = fitz.Matrix(scale_x, scale_y)
+                pix = page.get_pixmap(matrix=mat)
+
+                # Конвертируем координаты в пиксели
+                x0_px = int(instance.x0 * mat.a)
+                y0_px = int(pix.height - instance.y1 * mat.d)  # Переворот Y
+                x1_px = int(instance.x1 * mat.a)
+                y1_px = int(pix.height - instance.y0 * mat.d)
+
+                out.append({
+                    "page": page.number,
+                    "coord": {
+                        'x0': x0_px, 'y0': y0_px,
+                        'x1': x1_px, 'y1': y1_px
+                    }
+                })
+    doc.close()
+    return out
