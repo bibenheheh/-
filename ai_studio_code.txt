@@ -1,0 +1,1168 @@
+-- ==================== ПРЕСЕТЫ ДЛЯ КОМАНД СПАВНА ====================
+-- Если modelURL оставить пустым "", заспавнится ящик для настройки через E.
+-- Если указать прямые ссылки, модель загрузится сразу при вводе команды.
+local URLModelPresets = {
+	["spawn_model1"] = {
+		modelURL = "", -- например: "https://raw.githubusercontent.com/.../model.obj"
+		texURL = "",   -- например: "https://raw.githubusercontent.com/.../texture.png"
+		scale = 1,
+		physMode = 0,  -- 0 = Convex (динамическая), 1 = Static Mesh (точная, заморожена), 2 = Box
+		autoScale = true,
+		center = true,
+		yUp = true,
+		noCull = false,
+	},
+	-- Можешь добавить ещё команды:
+	-- ["spawn_model2"] = {
+	-- 	modelURL = "https://.../chair.obj",
+	-- 	texURL = "https://.../chair.png",
+	-- 	scale = 1,
+	-- 	physMode = 0,
+	-- 	autoScale = true,
+	-- 	center = true,
+	-- 	yUp = true,
+	-- 	noCull = false,
+	-- },
+}
+
+local ENT = {}
+
+ENT.Type = "anim"
+ENT.Base = "base_anim"
+
+ENT.PrintName = "3D Модель по ссылке"
+ENT.Author = "URL Model Loader"
+ENT.Category = "URL 3D Models"
+ENT.Spawnable = true
+ENT.AdminOnly = false
+
+function ENT:SetupDataTables()
+	self:NetworkVar("Int", 0, "ConfigRevision")
+end
+
+URLModelLoader = URLModelLoader or {}
+URLModelLoader.OBJCache = URLModelLoader.OBJCache or {}
+URLModelLoader.PendingOBJ = URLModelLoader.PendingOBJ or {}
+URLModelLoader.MaxFileSize = 10 * 1024 * 1024 -- 10 МБ
+URLModelLoader.MaxTriangles = 100000 -- максимум 100к треугольников
+
+function URLModelLoader.FetchOBJ(url, callback)
+	if URLModelLoader.OBJCache[url] then
+		callback(true, URLModelLoader.OBJCache[url])
+		return
+	end
+
+	if URLModelLoader.PendingOBJ[url] then
+		table.insert(URLModelLoader.PendingOBJ[url], callback)
+		return
+	end
+
+	URLModelLoader.PendingOBJ[url] = { callback }
+
+	http.Fetch(url, function(body, size, headers, code)
+		local waiters = URLModelLoader.PendingOBJ[url] or {}
+		URLModelLoader.PendingOBJ[url] = nil
+
+		if code < 200 or code >= 300 then
+			for _, cb in ipairs(waiters) do
+				cb(false, "HTTP ошибка загрузки модели: код " .. tostring(code))
+			end
+			return
+		end
+
+		if not body or #body == 0 then
+			for _, cb in ipairs(waiters) do
+				cb(false, "Пустой ответ от сервера при загрузке модели.")
+			end
+			return
+		end
+
+		if #body > URLModelLoader.MaxFileSize then
+			for _, cb in ipairs(waiters) do
+				cb(false, "Файл модели превышает лимит в 10 МБ.")
+			end
+			return
+		end
+
+		local head = string.lower(string.sub(body, 1, 128))
+		if string.find(head, "<html", 1, true) or string.find(head, "<!doctype", 1, true) then
+			for _, cb in ipairs(waiters) do
+				cb(false, "По ссылке вернулась HTML-страница вместо .obj файла. Нужна прямая (raw) ссылка!")
+			end
+			return
+		end
+
+		URLModelLoader.OBJCache[url] = body
+		for _, cb in ipairs(waiters) do
+			cb(true, body)
+		end
+	end, function(err)
+		local waiters = URLModelLoader.PendingOBJ[url] or {}
+		URLModelLoader.PendingOBJ[url] = nil
+
+		for _, cb in ipairs(waiters) do
+			cb(false, "Ошибка HTTP-запроса: " .. tostring(err))
+		end
+	end)
+end
+
+local function ConvertPos(x, y, z, yUp)
+	if yUp then
+		return Vector(-z, -x, y)
+	end
+	return Vector(x, y, z)
+end
+
+local function ConvertNormal(nx, ny, nz, yUp)
+	local v = yUp and Vector(-nz, -nx, ny) or Vector(nx, ny, nz)
+	if v:LengthSqr() > 0 then
+		v:Normalize()
+	else
+		v = Vector(0, 0, 1)
+	end
+	return v
+end
+
+function URLModelLoader.ParseOBJ(rawText, opts)
+	opts = opts or {}
+	local yUp = opts.yUp ~= false
+	local doCenter = opts.center ~= false
+	local autoScale = opts.autoScale ~= false
+	local userScale = tonumber(opts.scale) or 1
+	if userScale ~= userScale or userScale <= 0 then
+		userScale = 1
+	end
+
+	local positions = {}
+	local uvs = {}
+	local normals = {}
+	local triangles = {}
+	local triCount = 0
+
+	for line in string.gmatch(rawText, "[^\r\n]+") do
+		local commentPos = string.find(line, "#", 1, true)
+		if commentPos then
+			line = string.sub(line, 1, commentPos - 1)
+		end
+		line = string.Trim(line)
+
+		if line ~= "" then
+			local prefix = string.match(line, "^(%S+)")
+
+			if prefix == "v" then
+				local x, y, z = string.match(line, "^v%s+([%-%.%deE%+]+)%s+([%-%.%deE%+]+)%s+([%-%.%deE%+]+)")
+				if x and y and z then
+					positions[#positions + 1] = ConvertPos(tonumber(x) or 0, tonumber(y) or 0, tonumber(z) or 0, yUp)
+				end
+
+			elseif prefix == "vt" then
+				local u, v = string.match(line, "^vt%s+([%-%.%deE%+]+)%s+([%-%.%deE%+]+)")
+				if u and v then
+					uvs[#uvs + 1] = { u = tonumber(u) or 0, v = 1 - (tonumber(v) or 0) }
+				else
+					local uOnly = string.match(line, "^vt%s+([%-%.%deE%+]+)")
+					if uOnly then
+						uvs[#uvs + 1] = { u = tonumber(uOnly) or 0, v = 1 }
+					end
+				end
+
+			elseif prefix == "vn" then
+				local nx, ny, nz = string.match(line, "^vn%s+([%-%.%deE%+]+)%s+([%-%.%deE%+]+)%s+([%-%.%deE%+]+)")
+				if nx and ny and nz then
+					normals[#normals + 1] = ConvertNormal(tonumber(nx) or 0, tonumber(ny) or 0, tonumber(nz) or 0, yUp)
+				end
+
+			elseif prefix == "f" then
+				local faceVerts = {}
+				local first = true
+				for token in string.gmatch(line, "%S+") do
+					if first then
+						first = false
+					else
+						local parts = string.Split(token, "/")
+						local vi = tonumber(parts[1])
+						local ti = parts[2] and parts[2] ~= "" and tonumber(parts[2]) or nil
+						local ni = parts[3] and parts[3] ~= "" and tonumber(parts[3]) or nil
+
+						if vi and vi < 0 then vi = #positions + vi + 1 end
+						if ti and ti < 0 then ti = #uvs + ti + 1 end
+						if ni and ni < 0 then ni = #normals + ni + 1 end
+
+						if vi and positions[vi] then
+							local uv = (ti and uvs[ti]) or { u = 0, v = 0 }
+							local norm = ni and normals[ni] or nil
+
+							faceVerts[#faceVerts + 1] = {
+								pos = positions[vi],
+								u = uv.u,
+								v = uv.v,
+								normal = norm,
+							}
+						end
+					end
+				end
+
+				if #faceVerts >= 3 then
+					for i = 2, #faceVerts - 1 do
+						triCount = triCount + 1
+						if triCount > URLModelLoader.MaxTriangles then
+							return nil, "Слишком много полигонов (максимум " .. URLModelLoader.MaxTriangles .. ")."
+						end
+
+						local a = faceVerts[1]
+						local b = faceVerts[i]
+						local c = faceVerts[i + 1]
+
+						local flatNormal = nil
+						if not a.normal or not b.normal or not c.normal then
+							local n = (b.pos - a.pos):Cross(c.pos - a.pos)
+							if n:LengthSqr() > 0 then
+								n:Normalize()
+							else
+								n = Vector(0, 0, 1)
+							end
+							flatNormal = n
+						end
+
+						triangles[#triangles + 1] = {
+							pos = Vector(a.pos.x, a.pos.y, a.pos.z),
+							normal = a.normal and Vector(a.normal.x, a.normal.y, a.normal.z) or Vector(flatNormal.x, flatNormal.y, flatNormal.z),
+							u = a.u,
+							v = a.v,
+						}
+						triangles[#triangles + 1] = {
+							pos = Vector(b.pos.x, b.pos.y, b.pos.z),
+							normal = b.normal and Vector(b.normal.x, b.normal.y, b.normal.z) or Vector(flatNormal.x, flatNormal.y, flatNormal.z),
+							u = b.u,
+							v = b.v,
+						}
+						triangles[#triangles + 1] = {
+							pos = Vector(c.pos.x, c.pos.y, c.pos.z),
+							normal = c.normal and Vector(c.normal.x, c.normal.y, c.normal.z) or Vector(flatNormal.x, flatNormal.y, flatNormal.z),
+							u = c.u,
+							v = c.v,
+						}
+					end
+				end
+			end
+		end
+	end
+
+	if #triangles == 0 then
+		return nil, "В .obj файле не найдено геометрии (треугольников)."
+	end
+
+	local mins = Vector(math.huge, math.huge, math.huge)
+	local maxs = Vector(-math.huge, -math.huge, -math.huge)
+
+	for i = 1, #triangles do
+		local p = triangles[i].pos
+		if p.x < mins.x then mins.x = p.x end
+		if p.y < mins.y then mins.y = p.y end
+		if p.z < mins.z then mins.z = p.z end
+		if p.x > maxs.x then maxs.x = p.x end
+		if p.y > maxs.y then maxs.y = p.y end
+		if p.z > maxs.z then maxs.z = p.z end
+	end
+
+	local centerOffset = doCenter and ((mins + maxs) * 0.5) or Vector(0, 0, 0)
+	local size = maxs - mins
+	local maxDim = math.max(size.x, size.y, size.z)
+
+	local finalScale = userScale
+	if autoScale and maxDim > 0.0001 then
+		finalScale = (50 / maxDim) * userScale
+	end
+
+	for i = 1, #triangles do
+		triangles[i].pos = (triangles[i].pos - centerOffset) * finalScale
+	end
+
+	mins = (mins - centerOffset) * finalScale
+	maxs = (maxs - centerOffset) * finalScale
+
+	return {
+		triangles = triangles,
+		mins = mins,
+		maxs = maxs,
+	}
+end
+
+function URLModelLoader.BuildConvexPoints(triangles)
+	local seen = {}
+	local points = {}
+	local extremes = {}
+
+	for i = 1, #triangles do
+		local p = triangles[i].pos
+		local key = math.Round(p.x, 1) .. "_" .. math.Round(p.y, 1) .. "_" .. math.Round(p.z, 1)
+		if not seen[key] then
+			seen[key] = true
+			points[#points + 1] = p
+		end
+
+		if not extremes.minX or p.x < extremes.minX.x then extremes.minX = p end
+		if not extremes.maxX or p.x > extremes.maxX.x then extremes.maxX = p end
+		if not extremes.minY or p.y < extremes.minY.y then extremes.minY = p end
+		if not extremes.maxY or p.y > extremes.maxY.y then extremes.maxY = p end
+		if not extremes.minZ or p.z < extremes.minZ.z then extremes.minZ = p end
+		if not extremes.maxZ or p.z > extremes.maxZ.z then extremes.maxZ = p end
+	end
+
+	local maxConvexVerts = 400
+	if #points <= maxConvexVerts then
+		return points
+	end
+
+	local sampled = {}
+	local step = math.ceil(#points / (maxConvexVerts - 6))
+	for i = 1, #points, step do
+		sampled[#sampled + 1] = points[i]
+	end
+	for _, ep in pairs(extremes) do
+		sampled[#sampled + 1] = ep
+	end
+	return sampled
+end
+
+function URLModelLoader.ApplyPhysics(ent, parsed, physMode)
+	if not IsValid(ent) or not parsed then return end
+
+	local oldMins = ent:OBBMins()
+	local ok = false
+
+	if physMode == 1 and (#parsed.triangles / 3) <= 15000 then
+		ok = ent:PhysicsFromMesh(parsed.triangles)
+		if ok then
+			ent:SetMoveType(MOVETYPE_VPHYSICS)
+			ent:SetSolid(SOLID_VPHYSICS)
+			ent:EnableCustomCollisions(true)
+		end
+	elseif physMode == 0 then
+		local pts = URLModelLoader.BuildConvexPoints(parsed.triangles)
+		ok = ent:PhysicsInitConvex(pts)
+		if ok then
+			ent:SetMoveType(MOVETYPE_VPHYSICS)
+			ent:SetSolid(SOLID_VPHYSICS)
+			ent:EnableCustomCollisions(true)
+		end
+	end
+
+	if not ok then
+		local bMin = Vector(parsed.mins.x, parsed.mins.y, parsed.mins.z)
+		local bMax = Vector(parsed.maxs.x, parsed.maxs.y, parsed.maxs.z)
+		if (bMax.x - bMin.x) < 1 then bMin.x = bMin.x - 0.5; bMax.x = bMax.x + 0.5 end
+		if (bMax.y - bMin.y) < 1 then bMin.y = bMin.y - 0.5; bMax.y = bMax.y + 0.5 end
+		if (bMax.z - bMin.z) < 1 then bMin.z = bMin.z - 0.5; bMax.z = bMax.z + 0.5 end
+		ok = ent:PhysicsInitBox(bMin, bMax)
+	end
+
+	ent:SetCollisionBounds(parsed.mins, parsed.maxs)
+
+	local phys = ent:GetPhysicsObject()
+	if IsValid(phys) then
+		if SERVER then
+			local size = parsed.maxs - parsed.mins
+			local vol = math.max(1, size.x * size.y * size.z)
+			local mass = math.Clamp(vol * 0.002, 5, 5000)
+			phys:SetMass(mass)
+
+			if physMode == 1 then
+				phys:EnableMotion(false)
+			else
+				phys:EnableMotion(true)
+				phys:Wake()
+			end
+
+			if oldMins and parsed.mins.z < oldMins.z then
+				local lift = oldMins.z - parsed.mins.z
+				if lift > 0 and lift < 500 then
+					ent:SetPos(ent:GetPos() + Vector(0, 0, lift))
+				end
+			end
+		else
+			phys:EnableMotion(false)
+		end
+	end
+end
+
+-- ==================== СЕРВЕРНАЯ ЧАСТЬ ====================
+if SERVER then
+	util.AddNetworkString("URLModel_OpenMenu")
+	util.AddNetworkString("URLModel_ApplyConfig")
+	util.AddNetworkString("URLModel_Sync")
+	util.AddNetworkString("URLModel_RequestSync")
+	util.AddNetworkString("URLModel_Status")
+
+	local function SendStatus(ply, msg, isError)
+		if not IsValid(ply) then return end
+		net.Start("URLModel_Status")
+			net.WriteString(msg)
+			net.WriteBool(isError == true)
+		net.Send(ply)
+	end
+
+	local function WriteConfigToNet(cfg)
+		net.WriteString(cfg.modelURL or "")
+		net.WriteString(cfg.texURL or "")
+		net.WriteFloat(cfg.scale or 1)
+		net.WriteUInt(cfg.physMode or 0, 4)
+		net.WriteBool(cfg.autoScale ~= false)
+		net.WriteBool(cfg.center ~= false)
+		net.WriteBool(cfg.yUp ~= false)
+		net.WriteBool(cfg.noCull == true)
+	end
+
+	local function BroadcastSync(ent, targetPly)
+		if not IsValid(ent) or not ent.ModelConfig then return end
+
+		net.Start("URLModel_Sync")
+			net.WriteEntity(ent)
+			net.WriteUInt(ent.ConfigRev or 0, 32)
+			WriteConfigToNet(ent.ModelConfig)
+		if IsValid(targetPly) then
+			net.Send(targetPly)
+		else
+			net.Broadcast()
+		end
+	end
+
+	function ENT:SpawnFunction(ply, tr, ClassName)
+		if not tr.Hit then return end
+
+		local ent = ents.Create(ClassName)
+		if not IsValid(ent) then return end
+
+		ent:SetPos(tr.HitPos + tr.HitNormal * 24)
+		ent:Spawn()
+		ent:Activate()
+
+		if IsValid(ply) then
+			ent:SetCreator(ply)
+		end
+
+		return ent
+	end
+
+	function ENT:Initialize()
+		self:SetModel("models/props_junk/wood_crate001a.mdl")
+		self:PhysicsInit(SOLID_VPHYSICS)
+		self:SetMoveType(MOVETYPE_VPHYSICS)
+		self:SetSolid(SOLID_VPHYSICS)
+		self:SetUseType(SIMPLE_USE)
+
+		local phys = self:GetPhysicsObject()
+		if IsValid(phys) then
+			phys:Wake()
+		end
+	end
+
+	function ENT:Use(activator)
+		if not IsValid(activator) or not activator:IsPlayer() then return end
+		if activator:GetPos():DistToSqr(self:GetPos()) > 512 * 512 then return end
+
+		local cfg = self.ModelConfig or {
+			modelURL = "",
+			texURL = "",
+			scale = 1,
+			physMode = 0,
+			autoScale = true,
+			center = true,
+			yUp = true,
+			noCull = false,
+		}
+
+		net.Start("URLModel_OpenMenu")
+			net.WriteEntity(self)
+			WriteConfigToNet(cfg)
+		net.Send(activator)
+	end
+
+	function ENT:ApplyConfig(cfg, activatorPly)
+		local scale = tonumber(cfg.scale) or 1
+		if scale ~= scale then scale = 1 end
+		scale = math.Clamp(scale, 0.01, 100)
+
+		local physMode = math.Clamp(math.floor(tonumber(cfg.physMode) or 0), 0, 2)
+
+		local cleanCfg = {
+			modelURL = string.sub(string.Trim(cfg.modelURL or ""), 1, 2048),
+			texURL = string.sub(string.Trim(cfg.texURL or ""), 1, 2048),
+			scale = scale,
+			physMode = physMode,
+			autoScale = cfg.autoScale ~= false,
+			center = cfg.center ~= false,
+			yUp = cfg.yUp ~= false,
+			noCull = cfg.noCull == true,
+		}
+
+		if not string.match(cleanCfg.modelURL, "^https?://") then
+			SendStatus(activatorPly, "Неверная ссылка на модель (нужен http:// или https://).", true)
+			return
+		end
+
+		if cleanCfg.texURL ~= "" and not string.match(cleanCfg.texURL, "^https?://") then
+			SendStatus(activatorPly, "Неверная ссылка на текстуру (нужен http:// или https://).", true)
+			return
+		end
+
+		self.ConfigRev = (self.ConfigRev or 0) + 1
+		local currentRev = self.ConfigRev
+
+		self.ModelConfig = cleanCfg
+		self:SetConfigRevision(currentRev)
+
+		BroadcastSync(self, nil)
+
+		URLModelLoader.FetchOBJ(cleanCfg.modelURL, function(ok, dataOrErr)
+			if not IsValid(self) or self.ConfigRev ~= currentRev then return end
+
+			if not ok then
+				SendStatus(activatorPly, dataOrErr, true)
+				return
+			end
+
+			local parsed, parseErr = URLModelLoader.ParseOBJ(dataOrErr, cleanCfg)
+			if not parsed then
+				SendStatus(activatorPly, parseErr or "Ошибка разбора .obj на сервере.", true)
+				return
+			end
+
+			if cleanCfg.physMode == 1 and (#parsed.triangles / 3) > 15000 then
+				SendStatus(activatorPly, "Модель >15к полигонов: физика переключена на Convex для стабильности.", false)
+			end
+
+			URLModelLoader.ApplyPhysics(self, parsed, cleanCfg.physMode)
+		end)
+	end
+
+	function ENT:PreEntityCopy()
+		if self.ModelConfig then
+			duplicator.StoreEntityModifier(self, "URLModel_Config", self.ModelConfig)
+		end
+	end
+
+	duplicator.RegisterEntityModifier("URLModel_Config", function(ply, ent, data)
+		if IsValid(ent) and ent:GetClass() == "ent_url_model" and istable(data) then
+			ent:ApplyConfig(data, ply)
+		end
+	end)
+
+	net.Receive("URLModel_ApplyConfig", function(len, ply)
+		if not IsValid(ply) then return end
+
+		local now = CurTime()
+		if (ply.NextURLModelSubmit or 0) > now then return end
+		ply.NextURLModelSubmit = now + 0.5
+
+		local ent = net.ReadEntity()
+		if not IsValid(ent) or ent:GetClass() ~= "ent_url_model" then return end
+		if ply:GetPos():DistToSqr(ent:GetPos()) > 512 * 512 then return end
+		if ent.CPPICanTool and not ent:CPPICanTool(ply, "url_model") then return end
+
+		local cfg = {
+			modelURL = net.ReadString(),
+			texURL = net.ReadString(),
+			scale = net.ReadFloat(),
+			physMode = net.ReadUInt(4),
+			autoScale = net.ReadBool(),
+			center = net.ReadBool(),
+			yUp = net.ReadBool(),
+			noCull = net.ReadBool(),
+		}
+
+		ent:ApplyConfig(cfg, ply)
+	end)
+
+	net.Receive("URLModel_RequestSync", function(len, ply)
+		if not IsValid(ply) then return end
+
+		local ent = net.ReadEntity()
+		if not IsValid(ent) or ent:GetClass() ~= "ent_url_model" then return end
+		if not ent.ModelConfig then return end
+
+		BroadcastSync(ent, ply)
+	end)
+
+	hook.Add("PhysgunDrop", "URLModel_KeepStaticMeshFrozen", function(ply, ent)
+		if IsValid(ent) and ent:GetClass() == "ent_url_model" and ent.ModelConfig and ent.ModelConfig.physMode == 1 then
+			local phys = ent:GetPhysicsObject()
+			if IsValid(phys) then
+				phys:EnableMotion(false)
+			end
+		end
+	end)
+
+	hook.Add("CanPlayerUnfreeze", "URLModel_BlockStaticMeshUnfreeze", function(ply, ent)
+		if IsValid(ent) and ent:GetClass() == "ent_url_model" and ent.ModelConfig and ent.ModelConfig.physMode == 1 then
+			return false
+		end
+	end)
+
+	local function SpawnURLModelForPlayer(ply, presetCfg, args)
+		if not IsValid(ply) or not ply:IsPlayer() then return end
+		if not ply:Alive() then return end
+		if gamemode.Call("PlayerSpawnSENT", ply, "ent_url_model") == false then return end
+
+		if args and (args[1] == "https:" or args[1] == "http:") then
+			SendStatus(ply, 'Бери ссылки в кавычки: spawn_model1 "https://.../model.obj" "https://.../tex.png"', true)
+			return
+		end
+
+		local tr = util.TraceLine({
+			start = ply:EyePos(),
+			endpos = ply:EyePos() + ply:GetAimVector() * 300,
+			filter = ply,
+		})
+
+		local spawnPos = tr.Hit and (tr.HitPos + tr.HitNormal * 24) or tr.HitPos
+
+		local ent = ents.Create("ent_url_model")
+		if not IsValid(ent) then return end
+
+		ent:SetPos(spawnPos)
+		ent:SetAngles(Angle(0, ply:EyeAngles().y, 0))
+		ent:Spawn()
+		ent:Activate()
+		ent:SetCreator(ply)
+
+		if ent.CPPISetOwner then
+			ent:CPPISetOwner(ply)
+		end
+
+		undo.Create("3D Модель по ссылке")
+			undo.AddEntity(ent)
+			undo.SetPlayer(ply)
+		undo.Finish()
+
+		if ply.AddCleanup then
+			ply:AddCleanup("sents", ent)
+		end
+
+		local cfg = table.Copy(presetCfg or {})
+		if args and args[1] and args[1] ~= "" then
+			cfg.modelURL = args[1]
+			cfg.texURL = args[2] or ""
+		end
+
+		if cfg.modelURL and cfg.modelURL ~= "" then
+			timer.Simple(0.15, function()
+				if IsValid(ent) then
+					ent:ApplyConfig(cfg, ply)
+				end
+			end)
+		end
+	end
+
+	for cmdName, presetCfg in pairs(URLModelPresets) do
+		concommand.Add(cmdName, function(ply, cmd, args)
+			SpawnURLModelForPlayer(ply, presetCfg, args)
+		end)
+	end
+end
+
+-- ==================== КЛИЕНТСКАЯ ЧАСТЬ ====================
+if CLIENT then
+	URLModelLoader.MatCache = URLModelLoader.MatCache or {}
+	URLModelLoader.PendingTex = URLModelLoader.PendingTex or {}
+
+	local CACHE_DIR = "url_models_cache"
+	file.CreateDir(CACHE_DIR)
+
+	local function NotifyUser(msg, isError)
+		if notification and notification.AddLegacy then
+			notification.AddLegacy(msg, isError and NOTIFY_ERROR or NOTIFY_GENERIC, 4)
+		end
+		if isError then
+			surface.PlaySound("buttons/button10.wav")
+		else
+			surface.PlaySound("buttons/button14.wav")
+		end
+		MsgC(isError and Color(255, 100, 100) or Color(100, 220, 255), "[URL 3D Loader] ", color_white, msg .. "\n")
+	end
+
+	local function GetDefaultMaterial(noCull)
+		local key = noCull and "__default_nocull" or "__default"
+		if URLModelLoader.MatCache[key] then
+			return URLModelLoader.MatCache[key]
+		end
+
+		local mat
+		if noCull then
+			mat = CreateMaterial("urlmodel_default_nocull", "VertexLitGeneric", {
+				["$basetexture"] = "models/debug/debugwhite",
+				["$model"] = 1,
+				["$nocull"] = 1,
+			})
+		else
+			mat = Material("models/debug/debugwhite")
+		end
+
+		URLModelLoader.MatCache[key] = mat
+		return mat
+	end
+
+	local function BuildLitMaterialFromDisk(diskPath, cacheKey, noCull)
+		local rawMat = Material("data/" .. diskPath, "mips smooth noclamp")
+		if not rawMat or rawMat:IsError() then
+			return nil
+		end
+
+		local baseTex = rawMat:GetTexture("$basetexture")
+		if not baseTex or baseTex:IsErrorTexture() then
+			return nil
+		end
+
+		local mat = CreateMaterial("urlmodel_mat_" .. cacheKey, "VertexLitGeneric", {
+			["$basetexture"] = baseTex:GetName(),
+			["$model"] = 1,
+			["$nocull"] = noCull and 1 or 0,
+		})
+
+		return mat
+	end
+
+	local function LoadTextureFromURL(texURL, noCull, callback)
+		if not texURL or texURL == "" then
+			callback(GetDefaultMaterial(noCull), nil)
+			return
+		end
+
+		file.CreateDir(CACHE_DIR)
+
+		local hash = util.SHA256(texURL)
+		local cacheKey = hash .. (noCull and "_nc" or "")
+
+		if URLModelLoader.MatCache[cacheKey] then
+			callback(URLModelLoader.MatCache[cacheKey], nil)
+			return
+		end
+
+		local existingPath
+		for _, ext in ipairs({ "png", "jpg" }) do
+			local p = CACHE_DIR .. "/" .. hash .. "." .. ext
+			if file.Exists(p, "DATA") then
+				existingPath = p
+				break
+			end
+		end
+
+		if existingPath then
+			local mat = BuildLitMaterialFromDisk(existingPath, cacheKey, noCull)
+			if mat then
+				URLModelLoader.MatCache[cacheKey] = mat
+				callback(mat, nil)
+				return
+			end
+		end
+
+		if URLModelLoader.PendingTex[hash] then
+			table.insert(URLModelLoader.PendingTex[hash], { callback = callback, noCull = noCull, cacheKey = cacheKey })
+			return
+		end
+
+		URLModelLoader.PendingTex[hash] = { { callback = callback, noCull = noCull, cacheKey = cacheKey } }
+
+		http.Fetch(texURL, function(body, size, headers, code)
+			local waiters = URLModelLoader.PendingTex[hash] or {}
+			URLModelLoader.PendingTex[hash] = nil
+
+			if code < 200 or code >= 300 or not body or #body < 12 then
+				for _, w in ipairs(waiters) do
+					w.callback(GetDefaultMaterial(w.noCull), "Не удалось скачать текстуру (HTTP " .. tostring(code) .. ").")
+				end
+				return
+			end
+
+			if #body > 15 * 1024 * 1024 then
+				for _, w in ipairs(waiters) do
+					w.callback(GetDefaultMaterial(w.noCull), "Текстура слишком большая (лимит 15 МБ).")
+				end
+				return
+			end
+
+			local headLower = string.lower(string.sub(body, 1, 128))
+			if string.find(headLower, "<html", 1, true) or string.find(headLower, "<!doctype", 1, true) then
+				for _, w in ipairs(waiters) do
+					w.callback(GetDefaultMaterial(w.noCull), "По ссылке на текстуру пришла HTML-страница, а не картинка.")
+				end
+				return
+			end
+
+			local ext
+			if string.sub(body, 1, 8) == "\137PNG\r\n\026\n" then
+				ext = "png"
+			elseif string.sub(body, 1, 3) == "\255\216\255" then
+				ext = "jpg"
+			elseif string.sub(body, 1, 4) == "GIF8" then
+				ext = "png"
+			else
+				ext = string.match(string.lower(texURL), "%.jpe?g") and "jpg" or "png"
+			end
+
+			local diskPath = CACHE_DIR .. "/" .. hash .. "." .. ext
+			file.Write(diskPath, body)
+
+			timer.Simple(0, function()
+				for _, w in ipairs(waiters) do
+					local mat = URLModelLoader.MatCache[w.cacheKey] or BuildLitMaterialFromDisk(diskPath, w.cacheKey, w.noCull)
+					if mat then
+						URLModelLoader.MatCache[w.cacheKey] = mat
+						w.callback(mat, nil)
+					else
+						w.callback(GetDefaultMaterial(w.noCull), "Не удалось создать материал из текстуры (проверь формат PNG/JPG).")
+					end
+				end
+			end)
+		end, function(err)
+			local waiters = URLModelLoader.PendingTex[hash] or {}
+			URLModelLoader.PendingTex[hash] = nil
+
+			for _, w in ipairs(waiters) do
+				w.callback(GetDefaultMaterial(w.noCull), "Ошибка загрузки текстуры: " .. tostring(err))
+			end
+		end)
+	end
+
+	function ENT:DestroyMeshes()
+		if self.Meshes then
+			for i = 1, #self.Meshes do
+				local m = self.Meshes[i]
+				if IsValid(m) then
+					m:Destroy()
+				end
+			end
+			self.Meshes = nil
+		end
+	end
+
+	function ENT:BuildCustomMeshes(parsed, mat)
+		self:DestroyMeshes()
+
+		local tris = parsed.triangles
+		local maxChunkVerts = 65532
+		local meshes = {}
+
+		for startIdx = 1, #tris, maxChunkVerts do
+			local endIdx = math.min(startIdx + maxChunkVerts - 1, #tris)
+			local chunk = {}
+			for i = startIdx, endIdx do
+				chunk[#chunk + 1] = tris[i]
+			end
+
+			local imesh = Mesh(mat)
+			imesh:BuildFromTriangles(chunk)
+			meshes[#meshes + 1] = imesh
+		end
+
+		self.RenderMat = mat
+		self.Meshes = meshes
+		self:SetRenderBounds(parsed.mins, parsed.maxs)
+	end
+
+	function ENT:ApplyClientConfig(cfg, rev)
+		self.ClientConfig = cfg
+		self.ClientRevision = rev
+		self.RequestedRevision = rev
+
+		local parsedData = nil
+		local loadedMat = nil
+		local objDone = false
+		local texDone = false
+
+		local function TryFinalize()
+			if not objDone or not texDone then return end
+			if not IsValid(self) or self.ClientRevision ~= rev then return end
+			if not parsedData then return end
+
+			local finalMat = loadedMat or GetDefaultMaterial(cfg.noCull)
+			self:BuildCustomMeshes(parsedData, finalMat)
+			URLModelLoader.ApplyPhysics(self, parsedData, cfg.physMode)
+
+			NotifyUser("Модель загружена! Треугольников: " .. math.floor(#parsedData.triangles / 3), false)
+		end
+
+		NotifyUser("Загрузка 3D-модели...", false)
+
+		URLModelLoader.FetchOBJ(cfg.modelURL, function(ok, dataOrErr)
+			if not IsValid(self) or self.ClientRevision ~= rev then return end
+
+			if not ok then
+				NotifyUser(dataOrErr, true)
+				return
+			end
+
+			local parsed, parseErr = URLModelLoader.ParseOBJ(dataOrErr, cfg)
+			if not parsed then
+				NotifyUser(parseErr or "Ошибка парсинга .obj", true)
+				return
+			end
+
+			parsedData = parsed
+			objDone = true
+			TryFinalize()
+		end)
+
+		LoadTextureFromURL(cfg.texURL, cfg.noCull, function(mat, warnErr)
+			if not IsValid(self) or self.ClientRevision ~= rev then return end
+
+			if warnErr then
+				NotifyUser(warnErr, true)
+			end
+
+			loadedMat = mat
+			texDone = true
+			TryFinalize()
+		end)
+	end
+
+	function ENT:GetRenderMesh()
+		if self.Meshes and self.Meshes[1] and IsValid(self.Meshes[1]) and self.RenderMat then
+			return {
+				Mesh = self.Meshes[1],
+				Material = self.RenderMat,
+			}
+		end
+	end
+
+	function ENT:Draw()
+		self:DrawModel()
+
+		if self.Meshes and #self.Meshes > 1 and self.RenderMat then
+			local mtrx = Matrix()
+			mtrx:SetTranslation(self:GetPos())
+			mtrx:SetAngles(self:GetAngles())
+
+			local col = self:GetColor()
+			render.SetColorModulation(col.r / 255, col.g / 255, col.b / 255)
+			render.SetBlend(col.a / 255)
+
+			cam.PushModelMatrix(mtrx)
+			render.SetMaterial(self.RenderMat)
+			for i = 2, #self.Meshes do
+				local m = self.Meshes[i]
+				if IsValid(m) then
+					m:Draw()
+				end
+			end
+			cam.PopModelMatrix()
+
+			render.SetColorModulation(1, 1, 1)
+			render.SetBlend(1)
+		end
+	end
+
+	function ENT:Think()
+		local phys = self:GetPhysicsObject()
+		if IsValid(phys) then
+			phys:SetPos(self:GetPos())
+			phys:SetAngles(self:GetAngles())
+		end
+
+		local rev = self:GetConfigRevision()
+		if rev > 0 and self.ClientRevision ~= rev and self.RequestedRevision ~= rev then
+			self.RequestedRevision = rev
+			net.Start("URLModel_RequestSync")
+				net.WriteEntity(self)
+			net.SendToServer()
+		end
+	end
+
+	function ENT:OnRemove(fullUpdate)
+		if fullUpdate then return end
+		self:DestroyMeshes()
+	end
+
+	local function ReadConfigFromNet()
+		return {
+			modelURL = net.ReadString(),
+			texURL = net.ReadString(),
+			scale = net.ReadFloat(),
+			physMode = net.ReadUInt(4),
+			autoScale = net.ReadBool(),
+			center = net.ReadBool(),
+			yUp = net.ReadBool(),
+			noCull = net.ReadBool(),
+		}
+	end
+
+	net.Receive("URLModel_Sync", function()
+		local ent = net.ReadEntity()
+		local rev = net.ReadUInt(32)
+		local cfg = ReadConfigFromNet()
+
+		if not IsValid(ent) or ent:GetClass() ~= "ent_url_model" then return end
+		if ent.ClientRevision == rev then return end
+
+		ent:ApplyClientConfig(cfg, rev)
+	end)
+
+	net.Receive("URLModel_Status", function()
+		local msg = net.ReadString()
+		local isErr = net.ReadBool()
+		NotifyUser(msg, isErr)
+	end)
+
+	local function OpenURLModelMenu(ent, cfg)
+		if not IsValid(ent) then return end
+
+		if IsValid(URLModelLoader.ActiveMenu) then
+			URLModelLoader.ActiveMenu:Remove()
+		end
+
+		local frame = vgui.Create("DFrame")
+		URLModelLoader.ActiveMenu = frame
+		frame:SetTitle("Загрузчик 3D-модели по ссылке")
+		frame:SetSize(520, 415)
+		frame:Center()
+		frame:MakePopup()
+
+		local y = 34
+
+		local lblModel = vgui.Create("DLabel", frame)
+		lblModel:SetPos(14, y)
+		lblModel:SetSize(492, 18)
+		lblModel:SetText("Прямая ссылка на 3D-модель (.obj):")
+		y = y + 20
+
+		local entryModel = vgui.Create("DTextEntry", frame)
+		entryModel:SetPos(14, y)
+		entryModel:SetSize(492, 26)
+		entryModel:SetPlaceholderText("https://raw.githubusercontent.com/.../model.obj")
+		entryModel:SetText(cfg.modelURL or "")
+		y = y + 34
+
+		local lblTex = vgui.Create("DLabel", frame)
+		lblTex:SetPos(14, y)
+		lblTex:SetSize(492, 18)
+		lblTex:SetText("Прямая ссылка на текстуру (.png / .jpg, необязательно):")
+		y = y + 20
+
+		local entryTex = vgui.Create("DTextEntry", frame)
+		entryTex:SetPos(14, y)
+		entryTex:SetSize(492, 26)
+		entryTex:SetPlaceholderText("https://raw.githubusercontent.com/.../texture.png")
+		entryTex:SetText(cfg.texURL or "")
+		y = y + 34
+
+		local lblPhys = vgui.Create("DLabel", frame)
+		lblPhys:SetPos(14, y)
+		lblPhys:SetSize(492, 18)
+		lblPhys:SetText("Режим физики (коллизии):")
+		y = y + 20
+
+		local comboPhys = vgui.Create("DComboBox", frame)
+		comboPhys:SetPos(14, y)
+		comboPhys:SetSize(492, 26)
+		comboPhys:SetSortItems(false)
+		comboPhys:AddChoice("Выпуклая оболочка (Convex — динамическая физика)", 0, (cfg.physMode or 0) == 0)
+		comboPhys:AddChoice("Точная по полигонам (Static Mesh — заморожена)", 1, cfg.physMode == 1)
+		comboPhys:AddChoice("Простая коробка (Box — динамическая, лёгкая)", 2, cfg.physMode == 2)
+		y = y + 36
+
+		local sliderScale = vgui.Create("DNumSlider", frame)
+		sliderScale:SetPos(14, y)
+		sliderScale:SetSize(492, 28)
+		sliderScale:SetText("Множитель масштаба:")
+		sliderScale:SetMin(0.1)
+		sliderScale:SetMax(20)
+		sliderScale:SetDecimals(2)
+		sliderScale:SetValue(cfg.scale or 1)
+		y = y + 34
+
+		local chkAutoScale = vgui.Create("DCheckBoxLabel", frame)
+		chkAutoScale:SetPos(14, y)
+		chkAutoScale:SetText("Авто-размер (подогнать модель под ~50 юнитов)")
+		chkAutoScale:SetValue(cfg.autoScale ~= false)
+		chkAutoScale:SizeToContents()
+		y = y + 24
+
+		local chkCenter = vgui.Create("DCheckBoxLabel", frame)
+		chkCenter:SetPos(14, y)
+		chkCenter:SetText("Центрировать модель в её центре тяжести")
+		chkCenter:SetValue(cfg.center ~= false)
+		chkCenter:SizeToContents()
+		y = y + 24
+
+		local chkYUp = vgui.Create("DCheckBoxLabel", frame)
+		chkYUp:SetPos(14, y)
+		chkYUp:SetText("Ось Y вверх (стандарт экспорта Blender / OBJ)")
+		chkYUp:SetValue(cfg.yUp ~= false)
+		chkYUp:SizeToContents()
+		y = y + 24
+
+		local chkNoCull = vgui.Create("DCheckBoxLabel", frame)
+		chkNoCull:SetPos(14, y)
+		chkNoCull:SetText("Двусторонняя отрисовка (NoCull — если часть полигонов пропадает)")
+		chkNoCull:SetValue(cfg.noCull == true)
+		chkNoCull:SizeToContents()
+		y = y + 30
+
+		local btnApply = vgui.Create("DButton", frame)
+		btnApply:SetPos(14, y)
+		btnApply:SetSize(492, 34)
+		btnApply:SetText("Загрузить и сделать физической")
+		btnApply.DoClick = function()
+			if not IsValid(ent) then
+				frame:Close()
+				return
+			end
+
+			local modelURL = string.Trim(entryModel:GetValue())
+			local texURL = string.Trim(entryTex:GetValue())
+
+			if not string.match(modelURL, "^https?://") then
+				NotifyUser("Введи прямую ссылку на .obj (начинается с http:// или https://)", true)
+				return
+			end
+
+			if texURL ~= "" and not string.match(texURL, "^https?://") then
+				NotifyUser("Ссылка на текстуру должна начинаться с http:// или https:// (или оставь пустой)", true)
+				return
+			end
+
+			local _, selectedPhys = comboPhys:GetSelected()
+
+			net.Start("URLModel_ApplyConfig")
+				net.WriteEntity(ent)
+				net.WriteString(modelURL)
+				net.WriteString(texURL)
+				net.WriteFloat(sliderScale:GetValue())
+				net.WriteUInt(tonumber(selectedPhys) or 0, 4)
+				net.WriteBool(chkAutoScale:GetChecked())
+				net.WriteBool(chkCenter:GetChecked())
+				net.WriteBool(chkYUp:GetChecked())
+				net.WriteBool(chkNoCull:GetChecked())
+			net.SendToServer()
+
+			frame:Close()
+		end
+	end
+
+	net.Receive("URLModel_OpenMenu", function()
+		local ent = net.ReadEntity()
+		local cfg = ReadConfigFromNet()
+		OpenURLModelMenu(ent, cfg)
+	end)
+
+	concommand.Add("url_model_clear_cache", function()
+		URLModelLoader.OBJCache = {}
+		URLModelLoader.MatCache = {}
+
+		local files = file.Find(CACHE_DIR .. "/*", "DATA")
+		for _, f in ipairs(files) do
+			file.Delete(CACHE_DIR .. "/" .. f)
+		end
+
+		NotifyUser("Кэш загруженных моделей и текстур очищен.", false)
+	end)
+end
+
+scripted_ents.Register(ENT, "ent_url_model")
+
+if CLIENT and not URLModelLoader._SpawnmenuReloaded then
+	URLModelLoader._SpawnmenuReloaded = true
+	timer.Simple(0.1, function()
+		RunConsoleCommand("spawnmenu_reload")
+	end)
+end
